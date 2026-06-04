@@ -92,26 +92,34 @@ def onboard():
     config["llm"]["api_key"] = ask_input("  API Key", secret=True)
     config["llm"]["model"] = ask_input("  模型名", "deepseek-chat")
 
-    # ─── 多模态模型配置（视觉，用于看素材画面） ───
+    # ─── 多模态模型配置（视觉，看素材画面用） ───
     print("\n👁️  多模态模型（视觉）配置")
-    print("   用于预览视频素材画面，判断内容是否匹配。")
-    print("   如果不需要此功能，可以直接回车跳过。\n")
+    print("   用于预览视频素材画面，判断内容是否与文案匹配。")
+    print("   选 OpenAI 的话可以复用同一个 Key。\n")
 
-    if ask_yes_no("  配置多模态模型?", "N"):
-        vision_provider = ask_input("  提供商", "yunjuan")
-        config["vision"] = {"provider": vision_provider}
+    vision_auto = False
+    if provider == "openai":
+        if ask_yes_no("  复用 OpenAI 的 Key 做多模态? (gpt-4o 支持看图)", "Y"):
+            config["vision"] = {
+                "provider": "openai",
+                "base_url": config["llm"]["base_url"],
+                "api_key": config["llm"]["api_key"],
+                "model": ask_input("  视觉模型", "gpt-4o-mini"),
+            }
+            vision_auto = True
 
-        if vision_provider == "yunjuan":
-            config["vision"]["base_url"] = "https://yunjuan.top/v1"
-        elif vision_provider == "openai":
-            config["vision"]["base_url"] = "https://api.openai.com/v1"
-        elif vision_provider == "qwen":
-            config["vision"]["base_url"] = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-        else:
-            config["vision"]["base_url"] = ask_input("  接口地址")
+    if not vision_auto:
+        if ask_yes_no("  配置多模态视觉模型? (否则跳过)", "N"):
+            vision_provider = ask_input("  视觉提供商", "openai")
+            config["vision"] = {"provider": vision_provider}
 
-        config["vision"]["api_key"] = ask_input("  API Key", secret=True)
-        config["vision"]["model"] = ask_input("  模型名", "qwen3-vl-flash")
+            if vision_provider == "openai":
+                config["vision"]["base_url"] = "https://api.openai.com/v1"
+            else:
+                config["vision"]["base_url"] = ask_input("  接口地址")
+
+            config["vision"]["api_key"] = ask_input("  API Key", secret=True)
+            config["vision"]["model"] = ask_input("  视觉模型", "gpt-4o-mini")
 
     # ─── 用户信息 ───
     print("\n👤 用户信息")
