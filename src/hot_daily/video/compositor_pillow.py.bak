@@ -1,0 +1,332 @@
+"""视频合成模块 — 三明治画面结构（Pillow生成帧图 + FFmpeg单次渲染）"""
+
+import subprocess
+import os
+import re
+import math
+from pathlib import Path
+from typing import Optional
+from loguru import logger
+from PIL import Image, ImageDraw, ImageFont
+
+from hot_daily.models import VideoScript
+
+
+THEMES = {
+    "warm": {"top": (26, 10, 10), "bot": (26, 10, 10), "title": (255, 215, 0), "sub": (255, 255, 255)},
+    "cool": {"top": (10, 10, 26), "bot": (10, 10, 26), "title": (0, 191, 255), "sub": (255, 255, 255)},
+    "dark": {"top": (20, 20, 20), "bot": (20, 20, 20), "title": (232, 220, 200), "sub": (232, 232, 232)},
+    "gold": {"top": (240, 185, 50), "bot": (240, 185, 50), "title": (40, 20, 5), "sub": (35, 18, 4)},
+}
+
+_FONT_CACHE = {}
+
+
+class VideoCompositor:
+    """三明治画面合成器：上下背景板 + 中间素材区 + 标题/字幕"""
+
+    def __init__(self, output_dir="output/videos", width=1080, height=1920, fps=24, llm_client=None):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.width, self.height, self.fps = width, height, fps
+        self.llm = llm_client
+        self.top_h = int(height * 0.22)
+        self.mid_h = int(height * 0.56)
+        self.bot_h = int(height * 0.22)
+
+        self.title_font = self._font("NotoSerifCJK-Bold.ttc", 48)
+        self.sub_font = self._font("NotoSansCJK-Regular.ttc", 38)
+        self.source_font = self._font("NotoSansCJK-Regular.ttc", 22)
+
+    def _font(self, name, size):
+        key = f"{name}_{size}"
+        if key in _FONT_CACHE:
+            return _FONT_CACHE[key]
+        for d in ["/usr/share/fonts/opentype/noto/",
+                   "/usr/share/fonts/truetype/noto/",
+                   "/usr/share/fonts/truetype/"]:
+            p = os.path.join(d, name)
+            if os.path.exists(p):
+                f = ImageFont.truetype(p, size)
+                _FONT_CACHE[key] = f
+                return f
+        return ImageFont.load_default()
+
+    def compose(self, script, tts_path, subtitle_times=None,
+                media_paths=None, output_name="output.mp4",
+                theme="gold", deco="shadow"):
+        """合成完整视频"""
+        output_path = str(self.output_dir / output_name)
+        colors = THEMES.get(theme, THEMES["gold"])
+        blocks = self._build_blocks(script.sections, subtitle_times)
+        if not blocks:
+            return None
+
+        # 标题贯穿全程
+        clean_title = self._clean_title(script.title)
+
+        # 1. 为每段生成帧图片（跳过独立的标题画面📌）
+        frame_paths = []
+        content_blocks = [b for b in blocks if not b["text"].startswith("📌")]
+        for bi, blk in enumerate(content_blocks):
+            frame = self._render_frame(clean_title, blk["text"], "", colors, deco)
+            fp = str(self.output_dir / f"_f{bi}.png")
+            frame.save(fp)
+            frame_paths.append(fp)
+
+        # 2. 用 concat 分帧列表 + ffmpeg 一次渲染
+        # 生成 concat 描述文件（用 content_blocks 的索引）
+        outdir = str(self.output_dir)
+        concat_name = "_concat.txt"
+        concat_file = str(self.output_dir / concat_name)
+        with open(concat_file, "w") as f:
+            for bi, blk in enumerate(content_blocks):
+                dur = round(blk["end"] - blk["start"], 2)
+                if dur > 0:
+                    f.write(f"file '_f{bi}.png'\n")
+                    f.write(f"duration {dur}\n")
+
+        merged_name = "_merged.mp4"
+        merged = str(self.output_dir / merged_name)
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_name,
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+            "-r", str(self.fps),
+            merged_name,
+        ]
+        cwd = os.getcwd()
+        os.chdir(outdir)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        os.chdir(cwd)
+        if r.returncode != 0:
+            logger.error(f"视频渲染失败: {r.stderr[:400]}")
+            self._cleanup(frame_paths + [concat_file])
+            return None
+
+        # 3. 叠加素材视频到中间区域
+        # 先获取总时长和素材时长
+        total_dur = sum(b["end"] - b["start"] for b in content_blocks)
+        final_video = merged
+        if media_paths:
+            for mp in media_paths:
+                if mp and os.path.exists(mp) and os.path.getsize(mp) > 1000:
+                    # 获取素材时长
+                    dur_r = subprocess.run([
+                        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1", mp
+                    ], capture_output=True, text=True, timeout=10)
+                    mat_dur = float(dur_r.stdout.strip() or 0)
+
+                    # 如果素材比总时长短，用 concat 协议拼接够长
+                    mat_looped = mp
+                    if mat_dur > 0 and total_dur > mat_dur:
+                        repeat = int(total_dur / mat_dur) + 1
+                        logger.info(f"素材{mat_dur:.0f}s, 需要{total_dur:.0f}s, 拼接{repeat}次")
+                        list_path = str(self.output_dir / "_loop_list.txt")
+                        with open(list_path, "w") as f:
+                            for _ in range(repeat):
+                                f.write(f"file '{mp}'\n")
+                        mat_looped = str(self.output_dir / "_mat_looped.mp4")
+                        subprocess.run([
+                            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                            "-i", list_path, "-c", "copy", mat_looped
+                        ], capture_output=True, timeout=30)
+                        os.remove(list_path)
+
+                    logger.info(f"叠加素材: {os.path.basename(mp)}")
+                    overlaid = str(self.output_dir / "_overlaid.mp4")
+                    subprocess.run([
+                        "ffmpeg", "-y",
+                        "-i", mat_looped,
+                        "-i", merged,
+                        "-filter_complex",
+                        f"[0:v]scale={self.width}:{self.mid_h}[mat];"
+                        f"[1:v][mat]overlay=0:{self.top_h}",
+                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                        "-an", "-shortest",
+                        overlaid,
+                    ], capture_output=True, text=True, timeout=120)
+                    if os.path.exists(overlaid) and os.path.getsize(overlaid) > 1000:
+                        final_video = overlaid
+                    # 清理拼接文件
+                    if mat_looped != mp:
+                        try: os.remove(mat_looped)
+                        except: pass
+                    break
+
+        # 4. 混入音频
+        out = subprocess.run([
+            "ffmpeg", "-y", "-i", final_video, "-i", tts_path,
+            "-c:v", "copy", "-c:a", "aac", "-shortest", output_path,
+        ], capture_output=True, text=True, timeout=120)
+
+        # 清理
+        all_tmp = frame_paths + [concat_file, merged]
+        if final_video != merged:
+            all_tmp.append(final_video)
+        self._cleanup(all_tmp)
+
+        if out.returncode == 0 and os.path.exists(output_path):
+            logger.success(f"✅ 视频生成: {output_path}")
+            self.generate_thumbnail(output_path)
+            return output_path
+
+        logger.error(f"合成失败: {out.stderr[:200]}")
+        return None
+
+    def _cleanup(self, paths):
+        for p in paths:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    def _render_frame(self, title, subtitle, source, colors, deco="shadow"):
+        """渲染单帧 — 三种装饰模式选一：shadow/underline/plate"""
+        img = Image.new("RGB", (self.width, self.height), (0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        def apply_deco(d, text, font, tx, ty, tw, th, tcolor):
+            """根据 deco 模式应用一种装饰"""
+            if deco == "plate":
+                pad = 18 if font == self.title_font else 14
+                r = 8 if font == self.title_font else 6
+                draw.rounded_rectangle(
+                    [tx - pad, ty - 5, tx + tw + pad, ty + th + 5],
+                    radius=r, fill=(0, 0, 0, 45)
+                )
+            elif deco == "underline":
+                w = 3 if font == self.title_font else 2
+                draw.line([(tx, ty + th + 3), (tx + tw, ty + th + 3)], fill=tcolor, width=w)
+            else:  # shadow
+                offset = 2 if font == self.title_font else 1.5
+                draw.text((tx + offset, ty + offset), text, fill=(0, 0, 0, 80), font=font)
+            draw.text((tx, ty), text, fill=tcolor, font=font)
+
+        # ── 上背景板 ──
+        draw.rectangle([0, 0, self.width, self.top_h], fill=colors["top"])
+        if title:
+            lines = self._wrap_text(title, self.title_font, self.width - 100)[:2]
+            lh = int(self.title_font.size * 1.3)
+            total_h = len(lines) * lh
+            y0 = (self.top_h - total_h) / 2
+            for i, ln in enumerate(lines):
+                bb = draw.textbbox((0, 0), ln, font=self.title_font)
+                tw, th = bb[2] - bb[0], bb[3] - bb[1]
+                x = (self.width - tw) / 2
+                y = y0 + i * lh
+                apply_deco(draw, ln, self.title_font, x, y, tw, th, colors["title"])
+
+        # ── 下背景板 ──
+        draw.rectangle([0, self.top_h + self.mid_h, self.width, self.height], fill=colors["bot"])
+        lines = self._wrap_text(subtitle, self.sub_font, self.width - 100)[:3]
+        lh = int(self.sub_font.size * 1.35)
+        sub_h = len(lines) * lh
+        y0 = self.top_h + self.mid_h + (self.bot_h - sub_h) / 2
+        for i, ln in enumerate(lines):
+            bb = draw.textbbox((0, 0), ln, font=self.sub_font)
+            tw, th = bb[2] - bb[0], bb[3] - bb[1]
+            x = (self.width - tw) / 2
+            y = y0 + i * lh
+            apply_deco(draw, ln, self.sub_font, x, y, tw, th, colors["sub"])
+
+        return img
+
+    def _wrap_text(self, text, font, max_px):
+        """标点处换行 — 按像素宽度计算每行字符数"""
+        text = text.strip()
+        if not text:
+            return [""]
+        # 中文字符宽度 ≈ font.size，每行可容纳字数
+        chars_per_line = max(8, int(max_px / font.size))
+        breaks = [r'[。！？；]', r'[，、：]', r'[——…—]']
+        lines, rest = [], text
+        while rest:
+            if len(rest) <= chars_per_line:
+                lines.append(rest)
+                break
+            chunk = rest[:chars_per_line]
+            bp = -1
+            for p in breaks:
+                ms = list(re.finditer(p, chunk))
+                if ms:
+                    for m in reversed(ms):
+                        if m.end() > chars_per_line * 0.35:
+                            bp = m.end()
+                            break
+                    if bp > 0:
+                        break
+            if bp == -1:
+                bp = chars_per_line
+            lines.append(rest[:bp])
+            rest = rest[bp:].strip()
+        while len(lines) >= 2 and len(lines[-1]) <= 3:
+            lines[-2] += lines.pop()
+        return lines[:4]
+
+    def _build_blocks(self, sections, times):
+        """构建字幕时间块"""
+        blocks, ti = [], 0
+        for sec in sections:
+            t = sec.text.strip()
+            if not t:
+                continue
+            if t.startswith("📌"):
+                blocks.append({"text": t, "start": 0.0, "end": 2.0})
+                continue
+            if any(k in t for k in ["关注 Hot Daily", "每天一分钟"]):
+                prev = blocks[-1]["end"] if blocks else 2.0
+                blocks.append({"text": t, "start": prev, "end": prev + 2.5})
+                continue
+            if times and ti < len(times):
+                prev = blocks[-1]["end"] if blocks else 2.0
+                blocks.append({"text": t, "start": prev, "end": prev + times[ti]})
+                ti += 1
+            else:
+                prev = blocks[-1]["end"] if blocks else 2.0
+                dur = max(2.0, len(t) * 0.18)
+                blocks.append({"text": t, "start": prev, "end": prev + dur})
+        return blocks
+
+    def _clean_title(self, title):
+        """压缩标题为适合屏幕显示的短标题，保留核心实意"""
+        t = title.strip()
+        if not t:
+            return ""
+        # 短标题直接返回
+        if len(t) <= 15:
+            return t
+
+        # 有 LLM 则用它压缩
+        if self.llm:
+            try:
+                resp = self.llm.chat.completions.create(
+                    model="deepseek-chat",
+                    messages=[{
+                        "role": "user",
+                        "content": f"把下面这个新闻标题压缩成12个字以内的短标题，保留核心意思，直接输出不要解释：\n{t}"
+                    }],
+                    max_tokens=30,
+                    temperature=0.1,
+                )
+                short = resp.choices[0].message.content.strip().strip('"\'「」')
+                if short and len(short) <= 18:
+                    return short
+            except Exception:
+                pass
+
+        # 降级：按标点截断
+        for sep in ["？", "？", "?", "——", "—", "，", ","]:
+            if sep in t:
+                short = t.split(sep)[0]
+                if len(short) <= 18:
+                    return short
+        return t[:15] + "…" if len(t) > 15 else t
+
+    def generate_thumbnail(self, video_path, output_name="thumbnail.jpg"):
+        out = str(self.output_dir / output_name)
+        subprocess.run(["ffmpeg", "-y", "-i", video_path, "-vframes", "1", "-q:v", "2", out],
+                       capture_output=True, timeout=30)
+        return out if os.path.exists(out) else None

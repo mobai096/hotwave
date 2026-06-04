@@ -1,0 +1,16 @@
+# 🌊 Hot Wave 配置示例
+# 复制此文件为 config.yaml 后修改
+
+llm:
+  provider: deepseek
+  base_url: https://api.deepseek.com
+  api_key: your-api-key-here
+  model: deepseek-chat
+
+user_name: 创作者
+
+default_style: 科普
+default_duration: 30
+
+# 联动（可选）
+# linked_agent: ""

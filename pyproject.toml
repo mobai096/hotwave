@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hotwave"
+version = "0.1.0"
+description = "🌊 Hot Wave - AI 视频创作助手"
+authors = [{ name = "mobai" }]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+
+dependencies = [
+    "openai>=1.0.0",
+    "pyyaml>=6.0",
+    "loguru>=0.7.0",
+    "httpx>=0.27.0",
+    "pillow>=10.0",
+    "pydantic>=2.0",
+    "edge-tts>=6.0",
+    "playwright>=1.40",
+]
+
+[project.scripts]
+hotwave = "hotwave.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src", "."]
+include = ["hotwave*", "hot_daily*"]
