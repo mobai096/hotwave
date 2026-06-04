@@ -92,6 +92,27 @@ def onboard():
     config["llm"]["api_key"] = ask_input("  API Key", secret=True)
     config["llm"]["model"] = ask_input("  模型名", "deepseek-chat")
 
+    # ─── 多模态模型配置（视觉，用于看素材画面） ───
+    print("\n👁️  多模态模型（视觉）配置")
+    print("   用于预览视频素材画面，判断内容是否匹配。")
+    print("   如果不需要此功能，可以直接回车跳过。\n")
+
+    if ask_yes_no("  配置多模态模型?", "N"):
+        vision_provider = ask_input("  提供商", "yunjuan")
+        config["vision"] = {"provider": vision_provider}
+
+        if vision_provider == "yunjuan":
+            config["vision"]["base_url"] = "https://yunjuan.top/v1"
+        elif vision_provider == "openai":
+            config["vision"]["base_url"] = "https://api.openai.com/v1"
+        elif vision_provider == "qwen":
+            config["vision"]["base_url"] = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        else:
+            config["vision"]["base_url"] = ask_input("  接口地址")
+
+        config["vision"]["api_key"] = ask_input("  API Key", secret=True)
+        config["vision"]["model"] = ask_input("  模型名", "qwen3-vl-flash")
+
     # ─── 用户信息 ───
     print("\n👤 用户信息")
     config["user_name"] = ask_input("  你希望热浪怎么称呼你", "创作者")
